@@ -34,6 +34,7 @@ Windows'dan boshqa tizimda (masalan, Claude cloud sessiyasi, Linux) "proksi reji
 """
 import argparse
 import datetime as dt
+import http.client
 import importlib.util
 import json
 import mimetypes
@@ -51,7 +52,7 @@ try:
 except ImportError:  # Linux/macOS (masalan, Claude cloud sessiyasi)
     winreg = None
 
-VERSIYA = "2026-11-17"
+VERSIYA = "2026-11-17.2"
 PAPKA = os.path.dirname(os.path.abspath(__file__))
 # Proksi rejimi (Claude cloud): kalit skriptda bo'lmaydi, uni tarmoq proksisi so'rovga o'zi qo'shadi.
 PROKSI = os.name != "nt" or os.environ.get("YORDAMCHI_PROKSI") == "1"
@@ -113,7 +114,10 @@ MAXFIY_MATN = {
 }
 # Muhit o'zgaruvchilaridagi kalit/token qiymatlari (main() to'ldiradi): matnda uchrasa, yuborilmaydi.
 MUHIT_SIRLARI = {}
-MUHIT_NOMI = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|PAROL|CREDENTIAL", re.I)
+# Nom bo'lagi to'liq so'z bo'lishi kerak: GEMINI_API_KEY, BOT_TOKEN ushlanadi; KEYBOARD, TOKENIZERS, MONKEY emas.
+MUHIT_NOMI = re.compile(r"(?:^|_)(?:API_?KEY|KEY|TOKEN|SECRET|PASS|PASSWORD|PASSWD|PAROL|CREDENTIALS?)(?:_|$)", re.I)
+# Ulanish uzilishi, chala javob va h.k. (URLError, TimeoutError, ConnectionError hammasi OSError ichida).
+TARMOQ_XATOLARI = (OSError, http.client.HTTPException)
 
 
 def xato(matn, kod=2):
@@ -141,9 +145,21 @@ def api_sarlavha(kalit, qoshimcha=None):
     return s
 
 
+def sirga_oxshaydi(q):
+    """Qisqa qiymat, mavjud fayl yo'li va login-parolsiz havola sir emas; qolgani sir deb olinadi."""
+    if len(q) < 16:
+        return False
+    if "://" in q:
+        return "@" in q.split("://", 1)[1].split("/", 1)[0]
+    try:
+        return not os.path.exists(os.path.expanduser(q))
+    except (OSError, ValueError):
+        return True
+
+
 def muhit_sirlari(kalit):
     sirlar = {nom: q.strip() for nom, q in os.environ.items()
-              if MUHIT_NOMI.search(nom) and len(q.strip()) >= 16}
+              if MUHIT_NOMI.search(nom) and sirga_oxshaydi(q.strip())}
     if len(kalit) >= 16:
         sirlar["GEMINI_API_KEY"] = kalit
     return sirlar
@@ -241,8 +257,13 @@ def api_chaqir(model, vazifa, fayllar, kalit, max_chiqish, video=None, past_sifa
                 time.sleep(3 + urinish * 5)
                 continue
             return None, http_izoh(e), None
-        except (urllib.error.URLError, TimeoutError) as e:
-            return None, f"tarmoq: {e}", None
+        except TARMOQ_XATOLARI + (ValueError,) as e:
+            # Ulanish uzildi yoki javob chala keldi: vaqt tugashidan boshqa holatda qayta urinamiz.
+            vaqt_tugadi = isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)
+            if not vaqt_tugadi and urinish < urinishlar - 1:
+                time.sleep(3 + urinish * 5)
+                continue
+            return None, f"tarmoq: {type(e).__name__}: {e}", None
     return None, "urinishlar tugadi", None
 
 
@@ -372,7 +393,7 @@ def gemini_yukla(yol, mime, kalit):
         return nom, None, "Gemini videoni tayyorlashi juda uzoq cho'zildi"
     except urllib.error.HTTPError as e:
         return nom, None, "yuklash " + http_izoh(e)
-    except (urllib.error.URLError, TimeoutError, OSError, KeyError, ValueError) as e:
+    except TARMOQ_XATOLARI + (KeyError, ValueError) as e:
         return nom, None, f"yuklash: {e}"
 
 
@@ -380,7 +401,7 @@ def gemini_ochir(nom, kalit):
     try:
         so = urllib.request.Request(API_ASOS.format(nom), method="DELETE", headers=api_sarlavha(kalit))
         urllib.request.urlopen(so, timeout=30).close()
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except TARMOQ_XATOLARI:
         pass
 
 
@@ -517,4 +538,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:  # kutilmagan xato: uzun traceback o'rniga bitta qator (YORDAMCHI_DEBUG=1 to'liq ko'rsatadi)
+        if os.environ.get("YORDAMCHI_DEBUG") == "1":
+            raise
+        xato(f"kutilmagan xato: {type(e).__name__}: {e}", kod=4)
